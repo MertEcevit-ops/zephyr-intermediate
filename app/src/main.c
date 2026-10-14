@@ -1,75 +1,123 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/task_wdt/task_wdt.h>
+#include <zephyr/tracing/tracing.h>
 
-LOG_MODULE_REGISTER(demo, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(homework, LOG_LEVEL_INF);
 
-#define STACK_SIZE  1024
-#define QUEUE_SIZE  8
-#define PRODUCE_MS  100
-#define WDT_MS      500
-#define HEALTH_MS   200
-#define STUCK_AT    10      /* consumer gets stuck on this sample */
-#define STUCK_MS    3000
+#define STACK_SIZE            2048
+#define CONTROL_PRIORITY         3   /* above maintenance (4): was 7 */
+#define MAINTENANCE_PRIORITY     4
+#define EVENT_PERIOD_MS        250
+#define MAINTENANCE_LOAD_US  45000
+#define DEADLINE_MS             10   /* control work must start within 10 ms */
+#define WARN_INTERVAL_MS      1000
 
-K_MSGQ_DEFINE(sample_q, sizeof(uint32_t), QUEUE_SIZE, 4);
+struct control_event {
+    uint32_t seq;
+    uint32_t ready_ms;
+};
 
-static void producer_fn(void *p1, void *p2, void *p3)
+K_MSGQ_DEFINE(control_queue, sizeof(struct control_event), 4, 4);
+K_SEM_DEFINE(maintenance_start, 0, 1);
+
+/* ================================================================== */
+/*  Timer expiry: creates one control event                           */
+/* ================================================================== */
+
+static void event_timer_expiry(struct k_timer *timer)
 {
-    uint32_t sample = 0;
+    ARG_UNUSED(timer);
 
-    while (1) {
-        sample++;
-        if (k_msgq_put(&sample_q, &sample, K_NO_WAIT) != 0) {
-            LOG_ERR("[PRODUCER] queue full, sample %u dropped", sample);
+    static uint32_t seq;
+    struct control_event event = {
+        .seq = seq++,
+        .ready_ms = k_uptime_get_32(),
+    };
+
+    /* Timer expiry runs in interrupt context, so never wait here. */
+    int ret = k_msgq_put(&control_queue, &event, K_NO_WAIT);
+
+    if (ret != 0) {
+        return;
+    }
+
+    /* Both threads become ready when the timer interrupt returns. */
+    k_sem_give(&maintenance_start);
+
+    sys_trace_named_event("ctrl_ready", event.seq, event.ready_ms);
+}
+
+K_TIMER_DEFINE(event_timer, event_timer_expiry, NULL);
+
+/* ================================================================== */
+/*  Control thread                                                   */
+/* ================================================================== */
+
+static void control_fn(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+
+    uint32_t misses = 0;
+    uint32_t last_warn_ms = 0;
+
+    while (true) {
+        struct control_event event;
+        int ret = k_msgq_get(&control_queue, &event, K_FOREVER);
+
+        if (ret != 0) {
+            LOG_ERR("[CONTROL] receive failed: %d", ret);
+            continue;
         }
-        k_msleep(PRODUCE_MS);
+
+        /* Guarantee: control work starts within DEADLINE_MS of ready_ms */
+        uint32_t now = k_uptime_get_32();
+        uint32_t latency = now - event.ready_ms;
+
+        if (latency > DEADLINE_MS) {
+            misses++;
+            if (last_warn_ms == 0 || now - last_warn_ms >= WARN_INTERVAL_MS) {
+                LOG_WRN("[CONTROL] deadline miss seq=%u latency=%u ms misses=%u/%u",
+                        event.seq, latency, misses, event.seq + 1);
+                last_warn_ms = now;
+            }
+        }
+
+        LOG_INF("[CONTROL] processed seq=%u latency=%u ms misses=%u/%u",
+                event.seq, latency, misses, event.seq + 1);
+
+        sys_trace_named_event("ctrl_done", event.seq, latency);
     }
 }
 
-/* Runs in interrupt context when the consumer stops feeding its channel */
-static void wdt_cb(int channel_id, void *user_data)
+/* ================================================================== */
+/*  Background maintenance thread                                    */
+/* ================================================================== */
+
+static void maintenance_fn(void *p1, void *p2, void *p3)
 {
-    LOG_ERR("[WDT] channel %d expired, thread %s is stuck", channel_id,
-            k_thread_name_get(user_data));
-}
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
-static void consumer_fn(void *p1, void *p2, void *p3)
-{
-    int wdt_id = task_wdt_add(WDT_MS, wdt_cb, k_current_get());
-    uint32_t sample;
+    while (true) {
+        k_sem_take(&maintenance_start, K_FOREVER);
 
-    while (1) {
-        k_msgq_get(&sample_q, &sample, K_FOREVER);
-        task_wdt_feed(wdt_id);
-        LOG_INF("[CONSUMER] sample %u", sample);
-
-        if (sample == STUCK_AT) {
-            LOG_WRN("[CONSUMER] simulating stuck for %d ms", STUCK_MS);
-            k_msleep(STUCK_MS);
-        }
+        /* This work is important, but it has no short deadline. */
+        k_busy_wait(MAINTENANCE_LOAD_US);
     }
 }
 
-static void health_fn(void *p1, void *p2, void *p3)
+K_THREAD_DEFINE(control, STACK_SIZE, control_fn,
+                NULL, NULL, NULL, CONTROL_PRIORITY, 0, 0);
+
+K_THREAD_DEFINE(maintenance, STACK_SIZE, maintenance_fn,
+                NULL, NULL, NULL, MAINTENANCE_PRIORITY, 0, 0);
+
+int main(void)
 {
-    while (1) {
-        uint32_t used = k_msgq_num_used_get(&sample_q);
+    LOG_INF("=== L6 Homework: Runtime Investigation ===");
+    LOG_INF("Control work must start within 10 ms");
+    LOG_INF("Inspect, measure, trace, explain, and correct the delay");
 
-        if (used * 100 >= QUEUE_SIZE * 75) {
-            LOG_WRN("[HEALTH] queue at %u/%d", used, QUEUE_SIZE);
-        }
-        k_msleep(HEALTH_MS);
-    }
+    k_timer_start(&event_timer, K_MSEC(500), K_MSEC(EVENT_PERIOD_MS));
+
+    return 0;
 }
-
-K_THREAD_DEFINE(producer, STACK_SIZE, producer_fn, NULL, NULL, NULL, 5, 0, 0);
-K_THREAD_DEFINE(consumer, STACK_SIZE, consumer_fn, NULL, NULL, NULL, 5, 0, 0);
-K_THREAD_DEFINE(health, STACK_SIZE, health_fn, NULL, NULL, NULL, 6, 0, 0);
-
-static int wdt_init(void)
-{
-    return task_wdt_init(NULL);
-}
-
-SYS_INIT(wdt_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
