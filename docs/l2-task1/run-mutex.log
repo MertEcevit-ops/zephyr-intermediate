@@ -1,0 +1,5 @@
+*** Booting Zephyr OS build v4.2.0 ***
+[00:00:00.000,000] <inf> demo: mode: mutex-protected, 1000 increments per thread, 10 ms time slice
+[00:00:00.200,000] <inf> demo: counter = 2000, expected 2000, lost 0 updates (mutex-protected)
+
+Stopped at 1.010s

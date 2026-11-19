@@ -1,75 +1,111 @@
 #include <zephyr/kernel.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <zephyr/logging/log.h>
 
-#define PARSER_STACK_SIZE 2048
-#define SETTING_SIZE 16
+LOG_MODULE_REGISTER(demo, LOG_LEVEL_DBG);
 
-/*
- * Not const: a const array goes to flash, which user threads can read.
- * Aligned like the settings table entries, so the key sits at a whole entry index.
+#define STACK_SIZE 1024
+
+/* Equal priorities: neither thread can preempt the other, only the
+ * time slice (CONFIG_TIMESLICE_SIZE in prj.conf) switches between them.
  */
-static char device_key[32] __aligned(16) = "EC-PRIVATE-KEY:8f3a91c25d7e04b6";
+#define PRIO_A 5
+#define PRIO_B 5
 
-/* Const, so it is in flash: readable by the parser with or without isolation. */
-static const char settings[][SETTING_SIZE] __aligned(16) = {
-	"led=off",
-	"interval=10",
-	"mode=auto",
-};
+#define INCREMENTS    1000
+#define RMW_WINDOW_US 100   /* work done between reading and writing counter */
 
-K_THREAD_STACK_DEFINE(parser_stack, PARSER_STACK_SIZE);
-static struct k_thread parser_thread;
+#define MODE_NAME (IS_ENABLED(CONFIG_APP_COUNTER_USE_MUTEX) ? \
+                   "mutex-protected" : "unprotected")
 
-/*
- * Parses one command received from the network.
- * Supported command: "get=<n>", returns setting number n.
- */
-static void parse_command(const char *cmd)
+static uint32_t counter;
+K_MUTEX_DEFINE(counter_lock);
+
+void counter_fn(void *p1, void *p2, void *p3)
 {
-	if (strncmp(cmd, "get=", 4) == 0) {
-		long index = strtol(cmd + 4, NULL, 10);
-		char value[SETTING_SIZE];
+    for (int i = 0; i < INCREMENTS; i++) {
+        if (IS_ENABLED(CONFIG_APP_COUNTER_USE_MUTEX)) {
+            k_mutex_lock(&counter_lock, K_FOREVER);
+        }
 
-		/* Bug: the index comes from the packet and is not checked against the table size. */
-		memcpy(value, settings[index], sizeof(value));
-		printk("parser: setting %ld = %.16s\n", index, value);
-		return;
-	}
+        /*
+         * counter++ written out as three steps: read, modify, write.
+         *
+         * Without the mutex these steps are not atomic. Both threads have
+         * the same priority and time slicing is on, so when a thread's
+         * 10 ms slice expires the timer interrupt switches to the other
+         * thread, and that can happen inside k_busy_wait(), after the
+         * read and before the write. Example:
+         *
+         *   A: tmp = counter              (reads 500)
+         *   -- A's slice expires, B runs --
+         *   B: increments 100 times       (counter 500 -> 600)
+         *   -- B's slice expires, A runs --
+         *   A: counter = tmp + 1          (writes 501)
+         *
+         * A's write is based on a stale copy taken before B's writes, so
+         * it overwrites them and B's 100 increments are lost. B does the
+         * same to A when it resumes with its own stale tmp.
+         *
+         * With the mutex, B blocks in k_mutex_lock() while A holds the
+         * lock, so no thread can read counter while another one holds an
+         * unwritten copy of it, and every increment is kept.
+         */
+        uint32_t tmp = counter;
 
-	printk("parser: unknown command '%s'\n", cmd);
+        k_busy_wait(RMW_WINDOW_US);
+        counter = tmp + 1;
+
+        if (IS_ENABLED(CONFIG_APP_COUNTER_USE_MUTEX)) {
+            k_mutex_unlock(&counter_lock);
+        }
+    }
 }
 
-/*
- * Parser thread: receives three packets and parses them.
- * The first is a normal command, the other two are an attacker's commands,
- * each reading 16 bytes of the key.
- */
-static void parser_entry(void *attack_index, void *p2, void *p3)
-{
-	/* On this thread's stack, so the parser can always access them. */
-	char packets[3][32];
+K_THREAD_DEFINE(thread_a, STACK_SIZE, counter_fn,
+                NULL, NULL, NULL, PRIO_A, 0, 0);
+K_THREAD_DEFINE(thread_b, STACK_SIZE, counter_fn,
+                NULL, NULL, NULL, PRIO_B, 0, 0);
 
-	strcpy(packets[0], "get=0");
-	snprintf(packets[1], sizeof(packets[1]), "get=%ld", (long)attack_index);
-	snprintf(packets[2], sizeof(packets[2]), "get=%ld", (long)attack_index + 1);
-
-	for (int i = 0; i < ARRAY_SIZE(packets); i++) {
-		printk("parser: received '%s'\n", packets[i]);
-		parse_command(packets[i]);
-	}
-}
-
-/* Starts the parser thread. */
 int main(void)
 {
-	/* The attacker would compute this index from the firmware's ELF file. */
-	long attack_index = ((const char *)device_key - (const char *)settings) / SETTING_SIZE;
+    const uint32_t expected = 2 * INCREMENTS;
 
-	/* K_USER: the parser handles untrusted input, so it runs in user mode */
-	k_thread_create(&parser_thread, parser_stack, PARSER_STACK_SIZE,
-			parser_entry, (void *)attack_index, NULL, NULL,
-			5, K_USER, K_NO_WAIT);
-	return 0;
+    LOG_INF("mode: %s, %d increments per thread, %d ms time slice",
+            MODE_NAME, INCREMENTS, CONFIG_TIMESLICE_SIZE);
+
+    k_thread_join(thread_a, K_FOREVER);
+    k_thread_join(thread_b, K_FOREVER);
+
+    /*
+     * Measured on native_sim (Zephyr 4.2, 10 ms slice), logs in
+     * docs/l2-task1/:
+     *
+     *   mode              counter  expected  lost
+     *   mutex-protected      2000      2000     0
+     *   unprotected          1099      2000   901  (45 %)
+     *
+     * Both builds run the same loop under the same time slicing; the only
+     * difference is CONFIG_APP_COUNTER_USE_MUTEX.
+     *
+     * Mutex-protected: every read-modify-write runs to completion before
+     * the other thread may read counter. A slice can still expire inside
+     * the critical section, but the other thread then blocks on the lock
+     * and A gets the CPU back, so all 2000 increments are counted.
+     *
+     * Unprotected: at almost every slice switch the preempted thread is
+     * holding an unwritten tmp. When it resumes it writes tmp + 1, wiping
+     * out the ~100 increments the other thread made during its slice.
+     * That repeats over the ~20 slices of the 200 ms run, which is where
+     * the 901 missing updates went. The result is below the expected
+     * total and is not a count of anything meaningful.
+     *
+     * native_sim gives 1099 on every run: simulated code takes zero time,
+     * so the slice always expires inside k_busy_wait(). On real hardware
+     * the number varies from run to run, but stays well below 2000,
+     * because the 100 us window covers nearly all of each iteration.
+     */
+    LOG_INF("counter = %u, expected %u, lost %u updates (%s)",
+            counter, expected, expected - counter, MODE_NAME);
+
+    return 0;
 }
