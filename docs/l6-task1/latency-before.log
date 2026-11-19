@@ -1,0 +1,24 @@
+*** Booting Zephyr OS build v4.2.0 ***
+[00:00:00.000,000] <inf> homework: === L6 Homework: Runtime Investigation ===
+[00:00:00.000,000] <inf> homework: Control work must start within 10 ms
+[00:00:00.000,000] <inf> homework: Inspect, measure, trace, explain, and correct the delay
+[00:00:00.000,000] <inf> homework: control priority 7, maintenance priority 4, load 45000 us
+[00:00:00.545,000] <wrn> homework: [CONTROL] deadline miss seq=0 latency=45 ms misses=1/1
+[00:00:00.545,000] <inf> homework: [CONTROL] processed seq=0 latency=45 ms misses=1/1
+[00:00:00.795,000] <inf> homework: [CONTROL] processed seq=1 latency=45 ms misses=2/2
+[00:00:01.045,000] <inf> homework: [CONTROL] processed seq=2 latency=45 ms misses=3/3
+[00:00:01.295,000] <inf> homework: [CONTROL] processed seq=3 latency=45 ms misses=4/4
+[00:00:01.545,000] <wrn> homework: [CONTROL] deadline miss seq=4 latency=45 ms misses=5/5
+[00:00:01.545,000] <inf> homework: [CONTROL] processed seq=4 latency=45 ms misses=5/5
+[00:00:01.795,000] <inf> homework: [CONTROL] processed seq=5 latency=45 ms misses=6/6
+[00:00:02.045,000] <inf> homework: [CONTROL] processed seq=6 latency=45 ms misses=7/7
+[00:00:02.295,000] <inf> homework: [CONTROL] processed seq=7 latency=45 ms misses=8/8
+[00:00:02.545,000] <wrn> homework: [CONTROL] deadline miss seq=8 latency=45 ms misses=9/9
+[00:00:02.545,000] <inf> homework: [CONTROL] processed seq=8 latency=45 ms misses=9/9
+[00:00:02.795,000] <inf> homework: [CONTROL] processed seq=9 latency=45 ms misses=10/10
+[00:00:03.045,000] <inf> homework: [CONTROL] processed seq=10 latency=45 ms misses=11/11
+[00:00:03.295,000] <inf> homework: [CONTROL] processed seq=11 latency=45 ms misses=12/12
+[00:00:03.545,000] <wrn> homework: [CONTROL] deadline miss seq=12 latency=45 ms misses=13/13
+[00:00:03.545,000] <inf> homework: [CONTROL] processed seq=12 latency=45 ms misses=13/13
+[00:00:03.795,000] <inf> homework: [CONTROL] processed seq=13 latency=45 ms misses=14/14
+[00:00:04.045,000] <inf> homework: [CONTROL] processed seq=14 latency=45 ms misses=15/15

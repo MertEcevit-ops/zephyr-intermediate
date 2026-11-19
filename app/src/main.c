@@ -1,111 +1,145 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/tracing/tracing.h>
 
-LOG_MODULE_REGISTER(demo, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(homework, LOG_LEVEL_INF);
 
-#define STACK_SIZE 1024
+#define STACK_SIZE            2048
 
-/* Equal priorities: neither thread can preempt the other, only the
- * time slice (CONFIG_TIMESLICE_SIZE in prj.conf) switches between them.
+/*
+ * Root cause of the delay: with the original CONTROL_PRIORITY of 7, control
+ * was BELOW maintenance (4). Each timer event readies both threads at the
+ * same instant, so the scheduler always ran maintenance's 45 ms busy wait
+ * first while control sat ready in the queue, and control started 45 ms
+ * after ready_ms (deadline 10 ms).
+ *
+ * Fix: control runs at 3, above maintenance, so it is picked first (or
+ * preempts maintenance) and starts at once. Maintenance has no short
+ * deadline and simply runs after it. Selected with Kconfig so the "before"
+ * run uses the same code: -DEXTRA_CONF_FILE=before.conf sets it back to 7.
+ * Evidence and write-up: docs/l6-task1/.
  */
-#define PRIO_A 5
-#define PRIO_B 5
+#define CONTROL_PRIORITY      CONFIG_APP_CONTROL_PRIORITY   /* 3, was 7 */
+#define MAINTENANCE_PRIORITY     4
+#define EVENT_PERIOD_MS        250
+#define MAINTENANCE_LOAD_US  45000
+#define DEADLINE_MS             10   /* control work must start within 10 ms */
+#define WARN_INTERVAL_MS      1000
 
-#define INCREMENTS    1000
-#define RMW_WINDOW_US 100   /* work done between reading and writing counter */
+struct control_event {
+    uint32_t seq;
+    uint32_t ready_ms;
+};
 
-#define MODE_NAME (IS_ENABLED(CONFIG_APP_COUNTER_USE_MUTEX) ? \
-                   "mutex-protected" : "unprotected")
+K_MSGQ_DEFINE(control_queue, sizeof(struct control_event), 4, 4);
+K_SEM_DEFINE(maintenance_start, 0, 1);
 
-static uint32_t counter;
-K_MUTEX_DEFINE(counter_lock);
+/* ================================================================== */
+/*  Timer expiry: creates one control event                           */
+/* ================================================================== */
 
-void counter_fn(void *p1, void *p2, void *p3)
+static void event_timer_expiry(struct k_timer *timer)
 {
-    for (int i = 0; i < INCREMENTS; i++) {
-        if (IS_ENABLED(CONFIG_APP_COUNTER_USE_MUTEX)) {
-            k_mutex_lock(&counter_lock, K_FOREVER);
+    ARG_UNUSED(timer);
+
+    static uint32_t seq;
+    struct control_event event = {
+        .seq = seq++,
+        .ready_ms = k_uptime_get_32(),
+    };
+
+    /* Timer expiry runs in interrupt context, so never wait here. */
+    int ret = k_msgq_put(&control_queue, &event, K_NO_WAIT);
+
+    if (ret != 0) {
+        return;
+    }
+
+    /* Both threads become ready when the timer interrupt returns. */
+    k_sem_give(&maintenance_start);
+
+    sys_trace_named_event("ctrl_ready", event.seq, event.ready_ms);
+}
+
+K_TIMER_DEFINE(event_timer, event_timer_expiry, NULL);
+
+/* ================================================================== */
+/*  Control thread                                                   */
+/* ================================================================== */
+
+static void control_fn(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+
+    uint32_t misses = 0;
+    uint32_t last_warn_ms = 0;
+
+    while (true) {
+        struct control_event event;
+        int ret = k_msgq_get(&control_queue, &event, K_FOREVER);
+
+        if (ret != 0) {
+            LOG_ERR("[CONTROL] receive failed: %d", ret);
+            continue;
         }
 
         /*
-         * counter++ written out as three steps: read, modify, write.
-         *
-         * Without the mutex these steps are not atomic. Both threads have
-         * the same priority and time slicing is on, so when a thread's
-         * 10 ms slice expires the timer interrupt switches to the other
-         * thread, and that can happen inside k_busy_wait(), after the
-         * read and before the write. Example:
-         *
-         *   A: tmp = counter              (reads 500)
-         *   -- A's slice expires, B runs --
-         *   B: increments 100 times       (counter 500 -> 600)
-         *   -- B's slice expires, A runs --
-         *   A: counter = tmp + 1          (writes 501)
-         *
-         * A's write is based on a stale copy taken before B's writes, so
-         * it overwrites them and B's 100 increments are lost. B does the
-         * same to A when it resumes with its own stale tmp.
-         *
-         * With the mutex, B blocks in k_mutex_lock() while A holds the
-         * lock, so no thread can read counter while another one holds an
-         * unwritten copy of it, and every increment is kept.
+         * Guarantee: control work starts within DEADLINE_MS of ready_ms.
+         * Measured quantity: start latency = the time this thread got the
+         * CPU and took the event, minus ready_ms (stamped by the timer ISR
+         * when the event became ready). It is the time control spent ready
+         * but not running.
          */
-        uint32_t tmp = counter;
+        uint32_t now = k_uptime_get_32();
+        uint32_t latency = now - event.ready_ms;
 
-        k_busy_wait(RMW_WINDOW_US);
-        counter = tmp + 1;
-
-        if (IS_ENABLED(CONFIG_APP_COUNTER_USE_MUTEX)) {
-            k_mutex_unlock(&counter_lock);
+        if (latency > DEADLINE_MS) {
+            misses++;
+            if (last_warn_ms == 0 || now - last_warn_ms >= WARN_INTERVAL_MS) {
+                LOG_WRN("[CONTROL] deadline miss seq=%u latency=%u ms misses=%u/%u",
+                        event.seq, latency, misses, event.seq + 1);
+                last_warn_ms = now;
+            }
         }
+
+        LOG_INF("[CONTROL] processed seq=%u latency=%u ms misses=%u/%u",
+                event.seq, latency, misses, event.seq + 1);
+
+        sys_trace_named_event("ctrl_done", event.seq, latency);
     }
 }
 
-K_THREAD_DEFINE(thread_a, STACK_SIZE, counter_fn,
-                NULL, NULL, NULL, PRIO_A, 0, 0);
-K_THREAD_DEFINE(thread_b, STACK_SIZE, counter_fn,
-                NULL, NULL, NULL, PRIO_B, 0, 0);
+/* ================================================================== */
+/*  Background maintenance thread                                    */
+/* ================================================================== */
+
+static void maintenance_fn(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+
+    while (true) {
+        k_sem_take(&maintenance_start, K_FOREVER);
+
+        /* This work is important, but it has no short deadline. */
+        k_busy_wait(MAINTENANCE_LOAD_US);
+    }
+}
+
+K_THREAD_DEFINE(control, STACK_SIZE, control_fn,
+                NULL, NULL, NULL, CONTROL_PRIORITY, 0, 0);
+
+K_THREAD_DEFINE(maintenance, STACK_SIZE, maintenance_fn,
+                NULL, NULL, NULL, MAINTENANCE_PRIORITY, 0, 0);
 
 int main(void)
 {
-    const uint32_t expected = 2 * INCREMENTS;
+    LOG_INF("=== L6 Homework: Runtime Investigation ===");
+    LOG_INF("Control work must start within 10 ms");
+    LOG_INF("Inspect, measure, trace, explain, and correct the delay");
+    LOG_INF("control priority %d, maintenance priority %d, load %d us",
+            CONTROL_PRIORITY, MAINTENANCE_PRIORITY, MAINTENANCE_LOAD_US);
 
-    LOG_INF("mode: %s, %d increments per thread, %d ms time slice",
-            MODE_NAME, INCREMENTS, CONFIG_TIMESLICE_SIZE);
-
-    k_thread_join(thread_a, K_FOREVER);
-    k_thread_join(thread_b, K_FOREVER);
-
-    /*
-     * Measured on native_sim (Zephyr 4.2, 10 ms slice), logs in
-     * docs/l2-task1/:
-     *
-     *   mode              counter  expected  lost
-     *   mutex-protected      2000      2000     0
-     *   unprotected          1099      2000   901  (45 %)
-     *
-     * Both builds run the same loop under the same time slicing; the only
-     * difference is CONFIG_APP_COUNTER_USE_MUTEX.
-     *
-     * Mutex-protected: every read-modify-write runs to completion before
-     * the other thread may read counter. A slice can still expire inside
-     * the critical section, but the other thread then blocks on the lock
-     * and A gets the CPU back, so all 2000 increments are counted.
-     *
-     * Unprotected: at almost every slice switch the preempted thread is
-     * holding an unwritten tmp. When it resumes it writes tmp + 1, wiping
-     * out the ~100 increments the other thread made during its slice.
-     * That repeats over the ~20 slices of the 200 ms run, which is where
-     * the 901 missing updates went. The result is below the expected
-     * total and is not a count of anything meaningful.
-     *
-     * native_sim gives 1099 on every run: simulated code takes zero time,
-     * so the slice always expires inside k_busy_wait(). On real hardware
-     * the number varies from run to run, but stays well below 2000,
-     * because the 100 us window covers nearly all of each iteration.
-     */
-    LOG_INF("counter = %u, expected %u, lost %u updates (%s)",
-            counter, expected, expected - counter, MODE_NAME);
+    k_timer_start(&event_timer, K_MSEC(500), K_MSEC(EVENT_PERIOD_MS));
 
     return 0;
 }

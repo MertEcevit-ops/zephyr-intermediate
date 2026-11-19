@@ -1,15 +1,19 @@
-menu "L2 shared counter"
+menu "L6 latency investigation"
 
-config APP_COUNTER_USE_MUTEX
-	bool "Protect the shared counter with a mutex"
-	default y
+config APP_CONTROL_PRIORITY
+	int "Control thread priority"
+	default 3
 	help
-	  When enabled, each read-modify-write of the shared counter runs with
-	  counter_lock held, so the final value always equals 2 * INCREMENTS.
+	  Priority of the control thread (lower number = higher priority).
 
-	  Disable it to run the same loop without the lock and watch updates get
-	  lost. No code change is needed, add the overlay at build time:
-	    west build -b native_sim app -- -DEXTRA_CONF_FILE=unprotected.conf
+	  3 (default, the fix) is above the maintenance thread (4), so control
+	  preempts maintenance as soon as an event is ready and starts within
+	  the 10 ms deadline.
+
+	  7 is the original value, below maintenance. Build with the before.conf
+	  overlay to reproduce the deadline misses with the same workload and
+	  detector:
+	    west build -b native_sim app -- -DEXTRA_CONF_FILE=before.conf
 
 endmenu
 

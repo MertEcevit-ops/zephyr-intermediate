@@ -1,0 +1,26 @@
+# babeltrace2 --clock-seconds docs/l6-task1/trace-after   (excerpt: seq=5, ready at 1.750 s)
+[1.750000000] (+0.010000000) isr_enter: 
+[1.750000000] (+0.000000000) semaphore_give_enter: { id = 134620660 }
+[1.750000000] (+0.000000000) semaphore_give_exit: { id = 134620660 }
+[1.750000000] (+0.000000000) named_event: { name = "ctrl_ready", arg0 = 5, arg1 = 1750 }
+[1.750000000] (+0.000000000) isr_exit: 
+[1.750000000] (+0.000000000) thread_switched_out: { thread_id = 134625248, name = "idle" }
+[1.750000000] (+0.000000000) thread_switched_in: { thread_id = 134621024, name = "control" }
+[1.750000000] (+0.000000000) timer_start: { id = 134622368, duration = 1000000, period = 0 }
+[1.750000000] (+0.000000000) named_event: { name = "ctrl_done", arg0 = 5, arg1 = 0 }
+[1.750000000] (+0.000000000) thread_switched_out: { thread_id = 134621024, name = "control" }
+[1.750000000] (+0.000000000) thread_switched_in: { thread_id = 134620864, name = "maintenance" }
+[1.750000000] (+0.000000000) semaphore_take_exit: { id = 134620660, timeout = 4294966296, ret = 0 }
+[1.760000000] (+0.010000000) isr_enter: 
+[1.760000000] (+0.000000000) isr_exit: 
+[1.770000000] (+0.010000000) isr_enter: 
+[1.770000000] (+0.000000000) isr_exit: 
+[1.780000000] (+0.010000000) isr_enter: 
+[1.780000000] (+0.000000000) isr_exit: 
+[1.790000000] (+0.010000000) isr_enter: 
+[1.790000000] (+0.000000000) isr_exit: 
+[1.795000000] (+0.005000000) semaphore_take_enter: { id = 134620660, timeout = 4294966296 }
+[1.795000000] (+0.000000000) semaphore_take_blocking: { id = 134620660, timeout = 4294966296 }
+[1.795000000] (+0.000000000) thread_switched_out: { thread_id = 134620864, name = "maintenance" }
+[1.795000000] (+0.000000000) thread_switched_in: { thread_id = 134625248, name = "idle" }
+[1.795000000] (+0.000000000) idle: 
